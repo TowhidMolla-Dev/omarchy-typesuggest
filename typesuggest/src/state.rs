@@ -139,6 +139,27 @@ fn clean_context_word(word: &str) -> Option<String> {
         .then_some(clean)
 }
 
+/// Where the identifier segment ending at `end` begins, for a word that starts at
+/// `word_start`. Segments break where a capital letter follows a lower-case letter or a
+/// digit ("myProg"), and where a run of capitals ends before a lower-case letter, so that
+/// "HTTPServer" reads as "HTTP" plus "Server".
+fn segment_start(chars: &[char], word_start: usize, end: usize) -> usize {
+    // Walking back from the caret, the first boundary found is the one nearest it, which
+    // is where the segment being typed begins
+    for i in (word_start + 1..end).rev() {
+        let c = chars[i];
+        let prev = chars[i - 1];
+        let capital_after_lower = c.is_uppercase() && (prev.is_lowercase() || prev.is_numeric());
+        let end_of_capital_run = c.is_uppercase()
+            && prev.is_uppercase()
+            && chars.get(i + 1).is_some_and(|next| next.is_lowercase());
+        if capital_after_lower || end_of_capital_run {
+            return i;
+        }
+    }
+    word_start
+}
+
 /// The two words preceding the word that starts at `word_start`, nearest first
 fn context_before(before: &[char], word_start: usize) -> Context {
     let span = prev_word_span(before, word_start);
@@ -314,7 +335,13 @@ impl InputBuffer {
                 break;
             }
         }
-        let prefix: String = before[cur_word_start..cur].iter().collect();
+
+        // Inside an identifier only the segment being typed is completed, so "myProg"
+        // offers "myProgram" instead of looking for a word starting with "myProg". The
+        // context still comes from before the whole word, since "my" is part of this word
+        // rather than a word of its own.
+        let segment_begin = segment_start(before, cur_word_start, cur);
+        let prefix: String = before[segment_begin..cur].iter().collect();
 
         (prefix.clone(), context_before(before, cur_word_start))
     }
@@ -1088,6 +1115,75 @@ mod tests {
             sm.handle_key_press(0x0020, Some(' '), false, &dict),
             KeyAction::CommitCandidate { .. }
         ));
+    }
+
+    #[test]
+    fn test_identifier_segments_are_completed_on_their_own() {
+        let dict = setup_dict();
+        // Only the segment being typed is completed; the rest of the identifier stands
+        for (typed, segment, result) in [
+            ("myProg", "Prog", "myProgram "),
+            ("getProg", "Prog", "getProgram "),
+            ("utf8Prog", "Prog", "utf8Program "),
+            // A run of capitals ends before the capitalised word that follows it
+            ("HTTPServ", "Serv", "HTTPScreen "),
+            // Separators already split the word, and stay untouched
+            ("my_prog", "prog", "my_program "),
+            ("my-prog", "prog", "my-program "),
+        ] {
+            let mut sm = StateMachine::new(2);
+            for c in typed.chars() {
+                sm.handle_key_press(c as u32, Some(c), false, &dict);
+            }
+            assert_eq!(
+                sm.buffer.current_word_context().0,
+                segment,
+                "segment of {typed:?}"
+            );
+            sm.handle_key_press(KEY_TAB, None, false, &dict);
+            assert_eq!(
+                sm.buffer.chars.iter().collect::<String>(),
+                result,
+                "completing {typed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_identifier_needs_a_letter_in_the_last_segment() {
+        let dict = setup_dict();
+        // A trailing separator starts an empty segment, and there is nothing to complete
+        // until a letter is typed
+        for typed in ["my_", "my-", "my "] {
+            let mut sm = StateMachine::new(2);
+            for c in typed.chars() {
+                sm.handle_key_press(c as u32, Some(c), false, &dict);
+            }
+            assert_eq!(
+                sm.buffer.current_word_context().0,
+                "",
+                "segment of {typed:?}"
+            );
+            assert!(
+                matches!(sm.mode, InputMode::Idle),
+                "{typed:?} offered {:?}",
+                sm.mode
+            );
+        }
+    }
+
+    #[test]
+    fn test_camel_case_word_is_still_one_word_for_context() {
+        let dict = setup_dict();
+        let mut sm = StateMachine::new(3);
+        // "good morning" is a phrase; "myMorning" is one identifier, so the earlier
+        // segment must not be offered to the n-gram tables as the previous word
+        for c in "myMor".chars() {
+            sm.handle_key_press(c as u32, Some(c), false, &dict);
+        }
+        let (_, ctx) = sm.buffer.current_word_context();
+        assert_eq!(ctx.prev, None);
+        assert_eq!(ctx.prev_prev, None);
     }
 
     /// Whether the engine swallows the keystroke for this action instead of forwarding it

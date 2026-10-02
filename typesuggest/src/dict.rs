@@ -104,6 +104,34 @@ fn common_prefix_len(a: &str, b: &str) -> usize {
     a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
 }
 
+/// Spell `word` the way `typed` was spelled, so a suggestion fits the casing already on
+/// screen: "prog" gives "program", "Prog" gives "Program", "PROG" gives "PROGRAM" and
+/// "proG" gives "proGram". Whatever the user has not typed yet stays as the dictionary has
+/// it, which is lower case.
+fn match_case(typed: &str, word: &str) -> String {
+    // An all-capitals prefix means the whole word is an acronym or a constant
+    if typed.len() > 1 && typed.chars().all(|c| c.is_uppercase()) {
+        return word.to_uppercase();
+    }
+    // "I" and its contractions are the pronoun however they were typed
+    if word == "i" || word.starts_with("i'") {
+        let mut chars = word.chars();
+        return match chars.next() {
+            Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+            None => word.to_string(),
+        };
+    }
+    let typed: Vec<char> = typed.chars().collect();
+    word.chars()
+        .enumerate()
+        .map(|(i, c)| match typed.get(i) {
+            Some(t) if t.is_uppercase() => c.to_uppercase().collect::<String>(),
+            Some(t) if t.is_lowercase() => c.to_lowercase().collect::<String>(),
+            _ => c.to_string(),
+        })
+        .collect()
+}
+
 /// Order a follower list strongest first, breaking ties alphabetically, so the order
 /// suggestions come back in never depends on how the table file happened to be sorted
 fn sort_followers(followers: &mut [(String, u32)]) {
@@ -568,13 +596,6 @@ impl Dictionary {
             return Vec::new();
         }
 
-        let is_all_caps = prefix.len() > 1 && prefix.chars().all(|c| c.is_uppercase());
-        let is_capitalized = prefix
-            .chars()
-            .next()
-            .map(|c| c.is_uppercase())
-            .unwrap_or(false);
-
         // Apps that auto-insert typographic quotes type ’ for '
         let lower_prefix = prefix.to_lowercase().replace('\u{2019}', "'");
         let mut evidence: HashMap<String, Evidence> = HashMap::new();
@@ -660,19 +681,7 @@ impl Dictionary {
         results
             .into_iter()
             .take(limit)
-            .map(|cand| {
-                if is_all_caps {
-                    cand.to_uppercase()
-                } else if is_capitalized || cand == "i" || cand.starts_with("i'") {
-                    let mut chars = cand.chars();
-                    match chars.next() {
-                        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                        None => cand,
-                    }
-                } else {
-                    cand
-                }
-            })
+            .map(|cand| match_case(prefix, &cand))
             .collect()
     }
 
@@ -1121,6 +1130,17 @@ mod tests {
 
         let res_upper = dict.suggest("PRO", &Context::default(), 2);
         assert_eq!(res_upper, vec!["PROGRAM", "PROJECT"]);
+    }
+
+    #[test]
+    fn test_case_of_the_completion_follows_the_typed_segment() {
+        assert_eq!(match_case("prog", "program"), "program");
+        assert_eq!(match_case("Prog", "program"), "Program");
+        assert_eq!(match_case("PROG", "program"), "PROGRAM");
+        // Whatever has not been typed yet stays as the dictionary spells it
+        assert_eq!(match_case("proG", "program"), "proGram");
+        assert_eq!(match_case("i", "i"), "I");
+        assert_eq!(match_case("i", "i'm"), "I'm");
     }
 
     #[test]

@@ -26,6 +26,8 @@ A blazing fast, native **Windows-style hardware keyboard text suggestion tool** 
   - High-performance in-memory Trie with top 50,000 common English words ranked by frequency.
   - Typical lookup latency: **< 0.005 ms** (5 microseconds).
   - Preserves user capitalization (e.g. `prog` -> `program`, `Prog` -> `Program`, `PROG` -> `PROGRAM`).
+- **Identifier-Aware Completion:**
+  - Completes only the segment you are typing inside `snake_case`, `kebab-case`, and `camelCase` names, leaving the rest of the identifier untouched (`myProg` -> `myProgram`, `get_prog` -> `get_program`, `HTTPServ` -> `HTTPScreen`).
 - **Bidirectional Retro-Editing & Cross-Word Navigation:**
   - Moving the cursor into existing words queries the dictionary for the word at the caret.
   - Committing cleanly replaces both the prefix before the cursor and the suffix after the cursor.
