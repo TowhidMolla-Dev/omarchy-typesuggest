@@ -32,9 +32,21 @@ pub enum InputMode {
     },
 }
 
+impl InputMode {
+    /// The candidate the bar highlights. The best suggestion counts as selected from the
+    /// moment the bar appears, so taking it needs no separate keypress, and the two modes
+    /// differ only in how keys act rather than in what is highlighted.
+    pub fn selected_index(&self) -> Option<usize> {
+        match self {
+            InputMode::Idle => None,
+            InputMode::Suggesting { candidates, .. } => (!candidates.is_empty()).then_some(0),
+            InputMode::Navigating { selected_index, .. } => Some(*selected_index),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyAction {
-    /// Pass key directly to application
     PassThrough,
     /// Consume key without forwarding
     Consume,
@@ -48,7 +60,9 @@ pub enum KeyAction {
     /// Cancel navigation and swallow key (Down/Esc/Up while navigating)
     CancelNavigation,
     /// Update highlighted candidate index in suggestions bar
-    UpdateSelection { index: usize },
+    UpdateSelection {
+        index: usize,
+    },
     /// Commit candidate: replace `deleted_before` (text just before the cursor) and `deleted_after`
     /// (text just after it) with `replacement`
     CommitCandidate {
@@ -415,7 +429,10 @@ impl StateMachine {
     pub fn may_swallow(&self, keysym: u32, ctrl_active: bool) -> bool {
         match self.mode {
             InputMode::Navigating { .. } => true,
-            InputMode::Suggesting { .. } => keysym == KEY_UP && !ctrl_active,
+            // The bar preselects its best candidate, so Tab takes it without an Up press
+            InputMode::Suggesting { .. } => {
+                !ctrl_active && (keysym == KEY_UP || (keysym == KEY_TAB && self.accept_keys.tab))
+            }
             InputMode::Idle => false,
         }
     }
@@ -592,30 +609,12 @@ impl StateMachine {
             match keysym {
                 KEY_RIGHT => {
                     let next_idx = (current_idx + 1) % count;
-                    let (prefix, _) = self.buffer.current_word_prefix_and_prev();
-                    self.mode = InputMode::Navigating {
-                        prefix,
-                        suffix: self.buffer.current_word_suffix(),
-                        candidates,
-                        selected_index: next_idx,
-                    };
-                    return KeyAction::UpdateSelection { index: next_idx };
+                    return self.select_candidate(next_idx, candidates);
                 }
 
                 KEY_LEFT => {
-                    let prev_idx = if current_idx == 0 {
-                        count - 1
-                    } else {
-                        current_idx - 1
-                    };
-                    let (prefix, _) = self.buffer.current_word_prefix_and_prev();
-                    self.mode = InputMode::Navigating {
-                        prefix,
-                        suffix: self.buffer.current_word_suffix(),
-                        candidates,
-                        selected_index: prev_idx,
-                    };
-                    return KeyAction::UpdateSelection { index: prev_idx };
+                    let prev_idx = (current_idx + count - 1) % count;
+                    return self.select_candidate(prev_idx, candidates);
                 }
 
                 KEY_UP | KEY_DOWN | KEY_ESCAPE => {
@@ -625,30 +624,17 @@ impl StateMachine {
                 }
 
                 _ if is_accept_key => {
-                    // Commit selected candidate: accept keys (Enter, Space, Tab by default) commit
-                    // and are swallowed!
-                    let chosen = candidates[current_idx].clone();
-                    let (prefix, context) = self.buffer.current_word_context();
-                    let prev_word = context.prev.clone();
-                    let suffix = self.buffer.current_word_suffix();
-                    let replacement = if self.trailing_space {
-                        format!("{} ", chosen)
-                    } else {
-                        chosen.clone()
-                    };
-                    self.buffer.apply_replacement(
-                        prefix.chars().count(),
-                        suffix.chars().count(),
-                        &replacement,
-                    );
-                    self.mode = InputMode::Idle;
-                    return KeyAction::CommitCandidate {
-                        deleted_before: prefix,
-                        deleted_after: suffix,
-                        replacement,
-                        prev_word,
-                        chosen_word: chosen,
-                    };
+                    // Tab walks the list rather than taking the top word, so the alternatives
+                    // can be compared before committing. Tab on the last candidate takes it,
+                    // which is how you commit once the highlight has moved off the top one.
+                    if self.accept_keys.tab && keysym == KEY_TAB {
+                        if current_idx + 1 == count {
+                            return self.commit_candidate(current_idx, candidates);
+                        }
+                        return self.select_candidate(current_idx + 1, candidates);
+                    }
+                    // Enter and Space take the candidate the bar is pointing at
+                    return self.commit_candidate(current_idx, candidates);
                 }
 
                 _ => {
@@ -682,7 +668,62 @@ impl StateMachine {
     }
 
     /// 3. Normal typing & navigation keys (anything not handled as a shortcut or navigation key)
+    ///
+    /// Replace the word around the caret with `candidates[index]` and hand the app the
+    /// edit. Shared by both modes, so accepting the preselected candidate and accepting
+    /// one picked while navigating produce the same commit.
+    fn commit_candidate(&mut self, index: usize, candidates: Vec<String>) -> KeyAction {
+        let chosen = candidates[index].clone();
+        let (prefix, context) = self.buffer.current_word_context();
+        let prev_word = context.prev.clone();
+        let suffix = self.buffer.current_word_suffix();
+        let replacement = if self.trailing_space {
+            format!("{} ", chosen)
+        } else {
+            chosen.clone()
+        };
+        self.buffer
+            .apply_replacement(prefix.chars().count(), suffix.chars().count(), &replacement);
+        self.mode = InputMode::Idle;
+        KeyAction::CommitCandidate {
+            deleted_before: prefix,
+            deleted_after: suffix,
+            replacement,
+            prev_word,
+            chosen_word: chosen,
+        }
+    }
+
+    /// Move the highlight to `index`, keeping the bar's word and suffix as they are
+    fn select_candidate(&mut self, index: usize, candidates: Vec<String>) -> KeyAction {
+        let (prefix, _) = self.buffer.current_word_prefix_and_prev();
+        self.mode = InputMode::Navigating {
+            prefix,
+            suffix: self.buffer.current_word_suffix(),
+            candidates,
+            selected_index: index,
+        };
+        KeyAction::UpdateSelection { index }
+    }
+
     fn handle_typing_key(&mut self, keysym: u32, ch: Option<char>, dict: &Dictionary) -> KeyAction {
+        // The top candidate is highlighted as soon as the bar appears, so Tab can take it right
+        // away. Without this the key would reach the app, and taking the suggestion would
+        // need a separate Up press to select it first.
+        //
+        // Only Tab. Space and Enter keep their normal meaning while the bar is merely up:
+        // every word in the dictionary is a prefix of some longer entry ("work" of "work-",
+        // "set" of "set-up"), so accepting on Space would rewrite the word the user just
+        // finished typing. Accepting with those needs the bar engaged first, via Up or an
+        // arrow key.
+        if self.accept_keys.tab
+            && keysym == KEY_TAB
+            && let InputMode::Suggesting { candidates, .. } = &self.mode
+            && !candidates.is_empty()
+        {
+            let candidates = candidates.clone();
+            return self.commit_candidate(0, candidates);
+        }
         match keysym {
             KEY_UP => {
                 // If in Suggesting mode with candidates, Up enters navigation!
@@ -956,20 +997,19 @@ mod tests {
         assert_eq!(sm.mode, InputMode::Idle);
     }
 
+    /// The bar preselects its best candidate, so Tab walks the alternatives and commits
+    /// the last one, which is the only way to commit once the highlight has moved.
     #[test]
-    fn test_tab_selection_in_navigating() {
+    fn test_tab_walks_candidates_then_commits_the_last() {
         let dict = setup_dict();
         let mut sm = StateMachine::new(3);
 
-        sm.handle_key_press(0x0070, Some('p'), false, &dict);
-        sm.handle_key_press(0x0072, Some('r'), false, &dict);
-        sm.handle_key_press(0x006f, Some('o'), false, &dict);
+        for c in "pro".chars() {
+            sm.handle_key_press(c as u32, Some(c), false, &dict);
+        }
+        // Candidates are ["program", "project", "progress"]
 
-        // Press Up to enter navigation
-        let act = sm.handle_key_press(0xff52, None, false, &dict);
-        assert_eq!(act, KeyAction::UpdateSelection { index: 0 });
-
-        // Press Tab (0xff09): Must commit candidate and swallow Tab key!
+        // Tab alone, with no Up press first, takes the preselected candidate
         let act = sm.handle_key_press(0xff09, None, false, &dict);
         assert_eq!(
             act,
@@ -982,6 +1022,72 @@ mod tests {
             }
         );
         assert_eq!(sm.mode, InputMode::Idle);
+
+        // With the bar engaged, Tab walks the list instead of taking the top word
+        sm.reset();
+        for c in "pro".chars() {
+            sm.handle_key_press(c as u32, Some(c), false, &dict);
+        }
+        let act = sm.handle_key_press(0xff52, None, false, &dict);
+        assert_eq!(act, KeyAction::UpdateSelection { index: 0 });
+        assert_eq!(
+            sm.handle_key_press(0xff09, None, false, &dict),
+            KeyAction::UpdateSelection { index: 1 }
+        );
+        assert_eq!(
+            sm.handle_key_press(0xff09, None, false, &dict),
+            KeyAction::UpdateSelection { index: 2 }
+        );
+        // Tab on the last candidate takes it
+        assert_eq!(
+            sm.handle_key_press(0xff09, None, false, &dict),
+            KeyAction::CommitCandidate {
+                deleted_before: "pro".to_string(),
+                deleted_after: String::new(),
+                replacement: "progress ".to_string(),
+                prev_word: None,
+                chosen_word: "progress".to_string(),
+            }
+        );
+        assert_eq!(sm.mode, InputMode::Idle);
+    }
+
+    /// Space and Enter keep their ordinary meaning while the bar is merely up: every
+    /// dictionary word is a prefix of some longer entry, so accepting on Space would
+    /// rewrite the word that was just finished.
+    #[test]
+    fn test_space_and_enter_do_not_accept_until_the_bar_is_engaged() {
+        let dict = setup_dict();
+        let mut sm = StateMachine::new(3);
+
+        for c in "pro".chars() {
+            sm.handle_key_press(c as u32, Some(c), false, &dict);
+        }
+        assert!(matches!(sm.mode, InputMode::Suggesting { .. }));
+
+        // Space reaches the app rather than committing "program"
+        let act = sm.handle_key_press(0x0020, Some(' '), false, &dict);
+        assert!(!matches!(act, KeyAction::CommitCandidate { .. }), "{act:?}");
+        assert_eq!(sm.buffer.chars.iter().collect::<String>(), "pro ");
+
+        // So does Enter
+        sm.reset();
+        for c in "pro".chars() {
+            sm.handle_key_press(c as u32, Some(c), false, &dict);
+        }
+        let act = sm.handle_key_press(0xff0d, None, false, &dict);
+        assert!(!matches!(act, KeyAction::CommitCandidate { .. }), "{act:?}");
+
+        // Once engaged with Up, both commit the highlighted candidate
+        sm.reset();
+        for c in "pro".chars() {
+            sm.handle_key_press(c as u32, Some(c), false, &dict);
+        }
+        sm.handle_key_press(0xff52, None, false, &dict);
+        assert!(matches!(
+            sm.handle_key_press(0x0020, Some(' '), false, &dict),
+            KeyAction::CommitCandidate { .. }
+        ));
     }
 
     /// Whether the engine swallows the keystroke for this action instead of forwarding it

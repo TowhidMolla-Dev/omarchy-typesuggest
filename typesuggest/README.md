@@ -8,10 +8,12 @@ A blazing fast, native **Windows-style hardware keyboard text suggestion tool** 
 
 - **Exact Windows Text Suggestions UX:**
   - Floats a compact 3-pill suggestion bar just below the text caret (above it near the bottom of the screen), starting from the very 1st letter typed.
+  - The bar highlights its best suggestion from the moment it appears, so `Tab` takes it with no navigation first.
   - **Press `Up`**: Enters suggestion navigation mode without moving the document caret.
   - **Press `Left` / `Right`**: Cycles between the suggestion pills.
   - **Press `Down`, `Escape`, or `Up`**: Cancels suggestion navigation and returns focus directly to the document caret (swallowing the key).
-  - **Press `Enter`, `Space`, or `Tab`**: Commits the chosen candidate + trailing space and **swallows the keystroke** (preventing accidental message sending in chat apps like Discord, Slack, WhatsApp, Notion, etc.). Which keys commit and whether a space follows are configurable.
+  - **Press `Tab`** while navigating: cycles to the next pill, and commits it if it is the last one, so alternatives can be compared before taking one.
+  - **Press `Enter`, `Space`, or `Tab`**: Commits the chosen candidate + trailing space and **swallows the keystroke** (preventing accidental message sending in chat apps like Discord, Slack, WhatsApp, Notion, etc.). Which keys commit and whether a space follows are configurable. `Space` and `Enter` only commit once the bar has been engaged; while it is merely up they keep their normal meaning.
 - **Unrestricted Normal Typing & Caret Freedom:**
   - Words commit directly to the application; typing is never trapped in a locked pre-edit state.
   - Regular arrow keys and document navigation remain 100% free and unhindered.
@@ -154,13 +156,21 @@ systemctl --user restart typesuggest.service
 | Key | When Idle / Typing | When in Suggestions Navigation (`Up` active) |
 |---|---|---|
 | **Letters / Numbers** | Types normally into application | Leaves navigation and types normally |
-| **`Up`** | **Enters suggestions navigation** (highlights pill 1) | **Cancels navigation** (swallowed) |
+| **`Up`** | **Enters suggestions navigation** | **Cancels navigation** (swallowed) |
 | **`Right`** | Moves caret right in document | Cycles to next suggestion pill |
 | **`Left`** | Moves caret left in document | Cycles to previous suggestion pill |
 | **`Down` / `Escape`** | Moves caret down / unfocuses | **Cancels navigation** (returns to caret without moving, swallowed) |
 | **`Enter` / `Return`** | Inserts newline / submits in app | **Commits candidate + space** (swallowed, zero accidental chat sends) |
 | **`Space`** | Inserts space in document | **Commits candidate + space** (swallowed) |
-| **`Tab`** | Indents / tabs in app | **Commits candidate + space** (swallowed) |
+| **`Tab`** | **Commits the highlighted candidate + space** (swallowed) | **Cycles to the next pill**; on the last pill it commits it |
+
+The bar highlights its best suggestion as soon as it appears, so `Tab` takes it without any
+navigation first. Once you have entered navigation with `Up` or an arrow key, `Tab` walks the
+alternatives instead, and `Enter` or `Space` commits whichever pill is highlighted.
+
+`Space` and `Enter` deliberately keep their normal meaning while the bar is merely up. Every word
+in the dictionary is the prefix of some longer entry (`work` of `work-` and `set-up`, `set` of
+`setback`), so committing on `Space` would rewrite the word you had just finished typing.
 
 The keys that commit (`accept_keys`) and the space after the word (`trailing_space`) can be changed in the configuration. A key left out of `accept_keys` ends navigation and reaches the app as usual, so with `accept_keys = space, tab` Enter always sends your message.
 

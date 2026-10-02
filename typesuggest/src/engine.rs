@@ -389,15 +389,12 @@ impl Engine {
 
     /// Re-show the suggestions the state machine currently holds, if any
     pub fn redraw_current(&mut self, qh: &QueueHandle<Self>) {
-        let (candidates, selected) = match &self.state_machine.mode {
-            InputMode::Suggesting { candidates, .. } => (candidates.clone(), None),
-            InputMode::Navigating {
-                candidates,
-                selected_index,
-                ..
-            } => (candidates.clone(), Some(*selected_index)),
+        let candidates = match &self.state_machine.mode {
             InputMode::Idle => return,
+            InputMode::Suggesting { candidates, .. } => candidates.clone(),
+            InputMode::Navigating { candidates, .. } => candidates.clone(),
         };
+        let selected = self.state_machine.mode.selected_index();
         self.render_and_show(qh, &candidates, selected);
     }
 
@@ -425,7 +422,8 @@ impl Engine {
         self.surrounding = Some((text, cursor as usize));
         match action {
             KeyAction::ShowSuggestions { candidates, .. } => {
-                self.render_and_show(qh, &candidates, None);
+                let selected = self.state_machine.mode.selected_index();
+                self.render_and_show(qh, &candidates, selected);
             }
             KeyAction::HideSuggestions => {
                 self.hide();
@@ -1068,7 +1066,8 @@ impl Dispatch<zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2, (
                             forward!();
                             // Deliver the keystroke before spending time drawing the bar
                             let _ = conn.flush();
-                            state.render_and_show(qh, &candidates, None);
+                            let selected = state.state_machine.mode.selected_index();
+                            state.render_and_show(qh, &candidates, selected);
                         }
 
                         KeyAction::CancelNavigation => {
