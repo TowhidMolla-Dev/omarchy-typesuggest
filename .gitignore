@@ -12,3 +12,7 @@
 
 # Rust build output
 typesuggest/target/
+
+# Python bytecode from the data build scripts
+typesuggest/data/__pycache__/
+*.pyc

@@ -31,14 +31,17 @@ CLAUSE_BREAK = re.compile(r"[.!?;:,()\"“”—]+")
 ENDINGS = ("n't", "'s", "'m", "'re", "'ll", "'ve", "'d")
 
 
-def main(sentences_path, words_path):
+def load_vocabulary(words_path):
     vocabulary = set()
     with open(words_path, encoding="utf-8") as words:
         for line in words:
             parts = line.split()
             if parts:
                 vocabulary.add(parts[0].lower())
+    return vocabulary
 
+
+def make_known(vocabulary):
     def known(word):
         if word in LEFT_OUT:
             return False
@@ -53,7 +56,16 @@ def main(sentences_path, words_path):
                 return stem in vocabulary
         return False
 
-    pairs = collections.Counter()
+    return known
+
+
+def iter_clauses(sentences_path, known):
+    """Yield the word tokens of each clause of each sentence.
+
+    Sentences are lowercased, ’ becomes ', and split at punctuation; a clause
+    boundary is also a boundary between n-grams, so pairs and triples never
+    cross one.
+    """
     with bz2.open(sentences_path, "rt", encoding="utf-8") as sentences:
         for line in sentences:
             fields = line.rstrip("\n").split("\t")
@@ -61,10 +73,17 @@ def main(sentences_path, words_path):
                 continue
             text = fields[2].lower().replace("’", "'")
             for clause in CLAUSE_BREAK.split(text):
-                tokens = WORD.findall(clause)
-                for first, second in zip(tokens, tokens[1:]):
-                    if known(first) and known(second):
-                        pairs[(first, second)] += 1
+                yield WORD.findall(clause)
+
+
+def main(sentences_path, words_path):
+    known = make_known(load_vocabulary(words_path))
+
+    pairs = collections.Counter()
+    for tokens in iter_clauses(sentences_path, known):
+        for first, second in zip(tokens, tokens[1:]):
+            if known(first) and known(second):
+                pairs[(first, second)] += 1
 
     followers = collections.defaultdict(list)
     for (first, second), count in pairs.items():

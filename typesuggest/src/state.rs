@@ -1,5 +1,5 @@
 use crate::config::{AcceptKeys, Config};
-use crate::dict::Dictionary;
+use crate::dict::{Context, Dictionary};
 
 // Standard XKB keysym constants
 const KEY_UP: u32 = 0xff52;
@@ -91,52 +91,62 @@ pub fn extract_word_suffix(after_cursor: &str) -> &str {
     &after_cursor[..end_byte]
 }
 
-pub fn extract_prev_word_from_slice(before_word: &str) -> Option<String> {
-    let mut end = before_word.len();
-    for (idx, ch) in before_word.char_indices().rev() {
-        if ch.is_whitespace() {
-            end = idx;
-        } else {
-            break;
-        }
-    }
-
-    if end == 0 {
-        return None;
-    }
-
-    let non_ws = &before_word[..end];
+/// Walk back from `end` over whitespace and punctuation to the word before it.
+/// Returns None when a sentence boundary (`.`, `!`, `?` or a newline) sits in
+/// between, since the word before a full stop says nothing about the one after it.
+fn prev_word_span(before: &[char], end: usize) -> Option<(usize, usize)> {
     let mut word_end = end;
-    for (idx, ch) in non_ws.char_indices().rev() {
+    while word_end > 0 && before[word_end - 1].is_whitespace() {
+        word_end -= 1;
+    }
+    while word_end > 0 && !is_word_char(before[word_end - 1]) {
+        let ch = before[word_end - 1];
         if ch == '.' || ch == '!' || ch == '?' || ch == '\n' {
             return None;
         }
-        if is_word_char(ch) {
-            word_end = idx + ch.len_utf8();
-            break;
-        }
+        word_end -= 1;
     }
-
-    let word_part = &before_word[..word_end];
     let mut word_start = word_end;
-    for (idx, ch) in word_part.char_indices().rev() {
-        if is_word_char(ch) {
-            word_start = idx;
+    for (i, &c) in before[..word_end].iter().enumerate().rev() {
+        if is_word_char(c) {
+            word_start = i;
         } else {
             break;
         }
     }
+    (word_start < word_end).then_some((word_start, word_end))
+}
 
-    if word_start < word_end {
-        let word = before_word[word_start..word_end]
-            .trim()
-            .to_lowercase()
-            .replace('\u{2019}', "'");
-        if word.chars().count() >= 2 && word.chars().all(|c| c.is_alphabetic() || c == '\'') {
-            return Some(word);
-        }
-    }
-    None
+/// Whether a word can condition a completion: real letters only, so digits and
+/// codes stay out of the n-gram tables' keys, and at least two characters.
+fn clean_context_word(word: &str) -> Option<String> {
+    let clean = word.trim().to_lowercase().replace('\u{2019}', "'");
+    (clean.chars().count() >= 2 && clean.chars().all(|c| c.is_alphabetic() || c == '\''))
+        .then_some(clean)
+}
+
+/// The two words preceding the word that starts at `word_start`, nearest first
+fn context_before(before: &[char], word_start: usize) -> Context {
+    let span = prev_word_span(before, word_start);
+    let word_of = |(start, end): (usize, usize)| {
+        clean_context_word(&before[start..end].iter().collect::<String>())
+    };
+    let prev = span.and_then(word_of);
+    let prev_prev = span
+        .and_then(|(start, _)| prev_word_span(before, start))
+        .and_then(word_of);
+    Context::new(prev, prev_prev)
+}
+
+/// The word preceding `before_word` (a slice that ends where a word starts)
+pub fn extract_prev_word_from_slice(before_word: &str) -> Option<String> {
+    extract_context_from_slice(before_word).prev
+}
+
+/// The two words preceding `before_word`, for the text an application reported
+pub fn extract_context_from_slice(before_word: &str) -> Context {
+    let chars: Vec<char> = before_word.chars().collect();
+    context_before(&chars, chars.len())
 }
 
 /// Detect whether a command line invokes a sensitive command that prompts for credentials/passwords.
@@ -275,12 +285,13 @@ impl InputBuffer {
         self.cursor = self.chars.len();
     }
 
-    /// Extract the current word prefix immediately preceding the cursor, and the previous word for sentence context
-    pub fn current_word_prefix_and_prev(&self) -> (String, Option<String>) {
+    /// Extract the current word prefix immediately preceding the cursor, and the
+    /// two words before it that condition the completion
+    pub fn current_word_context(&self) -> (String, Context) {
         let cur = self.cursor.min(self.chars.len());
         let before = &self.chars[..cur];
 
-        // 1. Find start of current word prefix
+        // Find the start of the word being typed
         let mut cur_word_start = cur;
         for (i, &c) in before.iter().enumerate().rev() {
             if is_word_char(c) {
@@ -291,49 +302,13 @@ impl InputBuffer {
         }
         let prefix: String = before[cur_word_start..cur].iter().collect();
 
-        // 2. Find previous word before cur_word_start
-        let mut prev_word_end = cur_word_start;
-        while prev_word_end > 0 && before[prev_word_end - 1].is_whitespace() {
-            prev_word_end -= 1;
-        }
+        (prefix.clone(), context_before(before, cur_word_start))
+    }
 
-        // If there's punctuation between words, check if it's a sentence boundary (. ! ? \n)
-        if prev_word_end > 0 {
-            let last_char = before[prev_word_end - 1];
-            if last_char == '.' || last_char == '!' || last_char == '?' || last_char == '\n' {
-                return (prefix, None);
-            }
-            while prev_word_end > 0 && !is_word_char(before[prev_word_end - 1]) {
-                let ch = before[prev_word_end - 1];
-                if ch == '.' || ch == '!' || ch == '?' || ch == '\n' {
-                    return (prefix, None);
-                }
-                prev_word_end -= 1;
-            }
-        }
-
-        let mut prev_word_start = prev_word_end;
-        for (i, &c) in before[..prev_word_end].iter().enumerate().rev() {
-            if is_word_char(c) {
-                prev_word_start = i;
-            } else {
-                break;
-            }
-        }
-
-        let prev_word = if prev_word_start < prev_word_end {
-            let pw: String = before[prev_word_start..prev_word_end].iter().collect();
-            let clean = pw.trim().to_lowercase();
-            if clean.len() >= 2 && clean.chars().all(|c| c.is_alphabetic() || c == '\'') {
-                Some(clean)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        (prefix, prev_word)
+    /// The prefix, and only the word right before it
+    pub fn current_word_prefix_and_prev(&self) -> (String, Option<String>) {
+        let (prefix, ctx) = self.current_word_context();
+        (prefix, ctx.prev)
     }
 
     /// Extract the current word suffix immediately following the cursor
@@ -388,9 +363,9 @@ pub struct StateMachine {
     pub accept_keys: AcceptKeys,
     /// Append a space after the committed word
     pub trailing_space: bool,
-    /// Last (prefix, previous word) lookup and its result. GUI apps echo each keystroke back
+    /// Last (prefix, context) lookup and its result. GUI apps echo each keystroke back
     /// as surrounding text, which would otherwise repeat the same lookup two or three times.
-    last_suggestion: Option<(String, Option<String>, Vec<String>)>,
+    last_suggestion: Option<(String, Context, Vec<String>)>,
 }
 
 impl Default for StateMachine {
@@ -421,20 +396,16 @@ impl StateMachine {
         self.invalidate_suggestions();
     }
 
-    /// Memoized `Dictionary::suggest` for the current prefix and previous word
-    fn suggest(&mut self, dict: &Dictionary, prefix: &str, prev_word: Option<&str>) -> Vec<String> {
-        if let Some((p, pw, candidates)) = &self.last_suggestion
+    /// Memoized `Dictionary::suggest` for the current prefix and context
+    fn suggest(&mut self, dict: &Dictionary, prefix: &str, ctx: &Context) -> Vec<String> {
+        if let Some((p, c, candidates)) = &self.last_suggestion
             && p == prefix
-            && pw.as_deref() == prev_word
+            && c == ctx
         {
             return candidates.clone();
         }
-        let candidates = dict.suggest(prefix, prev_word, self.max_candidates);
-        self.last_suggestion = Some((
-            prefix.to_string(),
-            prev_word.map(str::to_string),
-            candidates.clone(),
-        ));
+        let candidates = dict.suggest(prefix, ctx, self.max_candidates);
+        self.last_suggestion = Some((prefix.to_string(), ctx.clone(), candidates.clone()));
         candidates
     }
 
@@ -495,7 +466,7 @@ impl StateMachine {
         let word_prefix = extract_word_prefix(before_cursor);
         let word_suffix = extract_word_suffix(after_cursor);
         let prev_slice = &before_cursor[..before_cursor.len().saturating_sub(word_prefix.len())];
-        let prev_word = extract_prev_word_from_slice(prev_slice);
+        let context = extract_context_from_slice(prev_slice);
 
         // Always sync the internal buffer with compositor surrounding text
         self.buffer
@@ -504,7 +475,7 @@ impl StateMachine {
         if word_prefix.chars().count() >= self.min_prefix_length
             && word_prefix.chars().any(|c| c.is_alphabetic())
         {
-            let candidates = self.suggest(dict, word_prefix, prev_word.as_deref());
+            let candidates = self.suggest(dict, word_prefix, &context);
             if !candidates.is_empty() {
                 match &self.mode {
                     InputMode::Navigating { selected_index, .. } => {
@@ -657,7 +628,8 @@ impl StateMachine {
                     // Commit selected candidate: accept keys (Enter, Space, Tab by default) commit
                     // and are swallowed!
                     let chosen = candidates[current_idx].clone();
-                    let (prefix, prev_word) = self.buffer.current_word_prefix_and_prev();
+                    let (prefix, context) = self.buffer.current_word_context();
+                    let prev_word = context.prev.clone();
                     let suffix = self.buffer.current_word_suffix();
                     let replacement = if self.trailing_space {
                         format!("{} ", chosen)
@@ -794,12 +766,12 @@ impl StateMachine {
             KEY_BACKSPACE => {
                 let had_char = self.buffer.backspace();
                 if had_char {
-                    let (prefix, prev_word) = self.buffer.current_word_prefix_and_prev();
+                    let (prefix, context) = self.buffer.current_word_context();
                     let suffix = self.buffer.current_word_suffix();
                     if prefix.chars().count() >= self.min_prefix_length
                         && prefix.chars().any(|c| c.is_alphabetic())
                     {
-                        let candidates = self.suggest(dict, &prefix, prev_word.as_deref());
+                        let candidates = self.suggest(dict, &prefix, &context);
                         if !candidates.is_empty() {
                             self.mode = InputMode::Suggesting {
                                 prefix: prefix.clone(),
@@ -816,12 +788,12 @@ impl StateMachine {
 
             KEY_DELETE => {
                 self.buffer.delete();
-                let (prefix, prev_word) = self.buffer.current_word_prefix_and_prev();
+                let (prefix, context) = self.buffer.current_word_context();
                 let suffix = self.buffer.current_word_suffix();
                 if prefix.chars().count() >= self.min_prefix_length
                     && prefix.chars().any(|c| c.is_alphabetic())
                 {
-                    let candidates = self.suggest(dict, &prefix, prev_word.as_deref());
+                    let candidates = self.suggest(dict, &prefix, &context);
                     if !candidates.is_empty() {
                         self.mode = InputMode::Suggesting {
                             prefix: prefix.clone(),
@@ -839,12 +811,12 @@ impl StateMachine {
                 if let Some(c) = ch {
                     self.buffer.insert_char(c);
                     if is_word_char(c) {
-                        let (prefix, prev_word) = self.buffer.current_word_prefix_and_prev();
+                        let (prefix, context) = self.buffer.current_word_context();
                         let suffix = self.buffer.current_word_suffix();
                         if prefix.chars().count() >= self.min_prefix_length
                             && prefix.chars().any(|ch| ch.is_alphabetic())
                         {
-                            let candidates = self.suggest(dict, &prefix, prev_word.as_deref());
+                            let candidates = self.suggest(dict, &prefix, &context);
                             if !candidates.is_empty() {
                                 self.mode = InputMode::Suggesting {
                                     prefix: prefix.clone(),
@@ -1494,6 +1466,65 @@ mod tests {
             extract_prev_word_from_slice("naïve\u{3000}").as_deref(),
             Some("naïve")
         );
+    }
+
+    #[test]
+    fn test_context_reaches_two_words_back() {
+        let ctx = extract_context_from_slice("as soon as ");
+        assert_eq!(ctx.prev.as_deref(), Some("as"));
+        assert_eq!(ctx.prev_prev.as_deref(), Some("soon"));
+
+        // Punctuation between the words is fine
+        let ctx = extract_context_from_slice("thank you, ");
+        assert_eq!(ctx.prev.as_deref(), Some("you"));
+        assert_eq!(ctx.prev_prev.as_deref(), Some("thank"));
+
+        // Only one word before the caret: no trigram context
+        let ctx = extract_context_from_slice("soon ");
+        assert_eq!(ctx.prev.as_deref(), Some("soon"));
+        assert_eq!(ctx.prev_prev, None);
+        assert_eq!(extract_context_from_slice("").prev, None);
+    }
+
+    #[test]
+    fn test_context_stops_at_a_sentence_boundary() {
+        // The word before a full stop says nothing about the one after it, so the
+        // trigram context has to start a fresh sentence rather than reach across
+        let ctx = extract_context_from_slice("I am fine. ");
+        assert_eq!(ctx.prev, None);
+        assert_eq!(ctx.prev_prev, None);
+
+        // Two words into the new sentence, both are available again
+        let ctx = extract_context_from_slice("I am fine. as soon ");
+        assert_eq!(ctx.prev.as_deref(), Some("soon"));
+        assert_eq!(ctx.prev_prev.as_deref(), Some("as"));
+
+        let ctx = extract_context_from_slice("done! as ");
+        assert_eq!(ctx.prev.as_deref(), Some("as"));
+        assert_eq!(ctx.prev_prev, None);
+    }
+
+    #[test]
+    fn test_buffer_reports_two_words_of_context() {
+        let mut b = InputBuffer::new();
+        for c in "as soon as ".chars() {
+            b.insert_char(c);
+        }
+        let (prefix, ctx) = b.current_word_context();
+        assert_eq!(prefix, "");
+        assert_eq!(ctx.prev.as_deref(), Some("as"));
+        assert_eq!(ctx.prev_prev.as_deref(), Some("soon"));
+
+        // The caret in the middle of a word: the prefix is what precedes it, and
+        // the words behind it are still the ones around the caret
+        for c in "mor".chars() {
+            b.insert_char(c);
+        }
+        b.move_left();
+        let (prefix, ctx) = b.current_word_context();
+        assert_eq!(prefix, "mo");
+        assert_eq!(ctx.prev.as_deref(), Some("as"));
+        assert_eq!(ctx.prev_prev.as_deref(), Some("soon"));
     }
 
     /// The engine forwards keys that `may_swallow` rules out before running the state machine,

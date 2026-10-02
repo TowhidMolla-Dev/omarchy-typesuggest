@@ -1,10 +1,33 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct WordCandidate {
     pub word: String,
     pub frequency: u64,
+}
+
+/// The words before the caret that condition a completion: `prev` is the word
+/// right before the one being typed, `prev_prev` the one before that.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Context {
+    pub prev: Option<String>,
+    pub prev_prev: Option<String>,
+}
+
+impl Context {
+    pub fn new(prev: Option<String>, prev_prev: Option<String>) -> Self {
+        Self { prev, prev_prev }
+    }
+}
+
+/// What the context tables said about one candidate, gathered in a single pass
+/// so scoring never rescans a follower list.
+#[derive(Debug, Clone, Copy, Default)]
+struct Evidence {
+    trigram: u32,
+    bigram: u32,
+    user: u32,
 }
 
 #[derive(Default)]
@@ -23,14 +46,74 @@ pub struct Dictionary {
     // Letter set of each entry in `words` (see `letter_bits`), kept contiguous so the typo scan can reject
     // most words without dereferencing their strings
     word_letters: Vec<u128>,
+    // Sum of every word frequency, the denominator of the unigram order
+    unigram_total: u64,
     // Preceding word -> sorted list of (follower_word, frequency)
     bigrams: HashMap<String, Vec<(String, u32)>>,
+    // Sum of the kept counts per preceding word, the denominator of the bigram order
+    bigram_totals: HashMap<String, u32>,
+    // Two preceding words -> sorted list of (follower_word, frequency)
+    trigrams: HashMap<(String, String), Vec<(String, u32)>>,
+    // Sum of the kept counts per pair of preceding words
+    trigram_totals: HashMap<(String, String), u32>,
     // User dynamically learned bigrams: preceding_word -> list of (follower_word, frequency)
     user_bigrams: HashMap<String, Vec<(String, u32)>>,
     learn_enabled: bool,
     // Fall back to similar words (typo correction) when no word starts with the prefix
     typo_correction: bool,
+    ranking: Ranking,
 }
+
+/// How the three language-model orders are mixed when ranking candidates, and
+/// how much an already-typed prefix lifts one.
+///
+/// Longer contexts are the more specific ones, so they carry more of the estimate.
+/// The weights are renormalized over whichever orders have data for the sentence
+/// in front of the caret, so a sentence the trigram table says nothing about is
+/// scored by the bigram and unigram alone rather than being held to a standard it
+/// cannot reach.
+#[derive(Debug, Clone, Copy)]
+pub struct Ranking {
+    pub unigram: f64,
+    pub bigram: f64,
+    pub trigram: f64,
+    /// Lift for how much of the word the user has already typed, relative to the
+    /// language-model score. Scaled by word length so it ranks words against each
+    /// other rather than long words against short ones.
+    pub prefix_weight: f64,
+    /// Added to a candidate the user has already chosen after the previous word.
+    /// Learned phrases are counted in single digits, not the millions the corpus
+    /// reaches, so they cannot be turned into a probability and get a flat priority.
+    pub learned_bonus: f64,
+}
+
+impl Default for Ranking {
+    fn default() -> Self {
+        Self {
+            unigram: 0.20,
+            bigram: 0.35,
+            trigram: 0.45,
+            prefix_weight: 0.8,
+            learned_bonus: 1.0,
+        }
+    }
+}
+
+/// Length of the common prefix of two words, in characters
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
+}
+
+/// Order a follower list strongest first, breaking ties alphabetically, so the order
+/// suggestions come back in never depends on how the table file happened to be sorted
+fn sort_followers(followers: &mut [(String, u32)]) {
+    followers.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+}
+
+/// How many of the most frequent words for a prefix join the candidate pool.
+/// All of them are scored, so this is headroom for the context tables to promote
+/// a word that unigram frequency alone would not have put in front of the user.
+const UNIGRAM_POOL: usize = 15;
 
 impl Default for Dictionary {
     fn default() -> Self {
@@ -44,11 +127,21 @@ impl Dictionary {
             root: TrieNode::default(),
             words: Vec::new(),
             word_letters: Vec::new(),
+            unigram_total: 0,
             bigrams: HashMap::new(),
+            bigram_totals: HashMap::new(),
+            trigrams: HashMap::new(),
+            trigram_totals: HashMap::new(),
             user_bigrams: HashMap::new(),
             learn_enabled: true,
             typo_correction: true,
+            ranking: Ranking::default(),
         }
+    }
+
+    /// Replace the weights the suggestion ranking uses
+    pub fn set_ranking(&mut self, ranking: Ranking) {
+        self.ranking = ranking;
     }
 
     pub fn set_learning(&mut self, enabled: bool) {
@@ -92,6 +185,49 @@ impl Dictionary {
                 let entry = self.bigrams.entry(w1.to_string()).or_default();
                 entry.push((w2.to_string(), freq));
             }
+        }
+        for followers in self.bigrams.values_mut() {
+            sort_followers(followers);
+        }
+        self.rebuild_bigram_totals();
+    }
+
+    /// Load trigrams from TSV formatted text: each line is "w1\tw2\tw3\tfrequency"
+    pub fn load_trigrams_tsv(&mut self, text: &str) {
+        for line in text.lines() {
+            let mut parts = line.split('\t');
+            if let (Some(w1), Some(w2), Some(w3), Some(freq_str)) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+                && let Ok(freq) = freq_str.parse::<u32>()
+            {
+                let entry = self
+                    .trigrams
+                    .entry((w1.to_string(), w2.to_string()))
+                    .or_default();
+                entry.push((w3.to_string(), freq));
+            }
+        }
+        for followers in self.trigrams.values_mut() {
+            sort_followers(followers);
+        }
+        self.rebuild_trigram_totals();
+    }
+
+    /// The bigram order is a distribution over the followers each word keeps, so
+    /// every score needs the sum of those counts as its denominator.
+    fn rebuild_bigram_totals(&mut self) {
+        self.bigram_totals.clear();
+        for (leader, followers) in &self.bigrams {
+            let sum = followers.iter().map(|(_, f)| *f).sum();
+            self.bigram_totals.insert(leader.clone(), sum);
+        }
+    }
+
+    fn rebuild_trigram_totals(&mut self) {
+        self.trigram_totals.clear();
+        for (key, followers) in &self.trigrams {
+            let sum = followers.iter().map(|(_, f)| *f).sum();
+            self.trigram_totals.insert(key.clone(), sum);
         }
     }
 
@@ -228,28 +364,101 @@ impl Dictionary {
                 .get(w)
                 .map_or_else(|| w.to_string(), |c| c.to_string())
         };
-        let mut merged: HashMap<String, HashMap<String, u32>> = HashMap::new();
-        for (leader, followers) in self.bigrams.drain() {
-            let entry = merged.entry(canonical(&leader)).or_default();
-            for (follower, count) in followers {
-                let count = if spellings.contains_key(follower.as_str()) && needs_scaling(&follower)
-                {
-                    (f64::from(count) * scale).min(f64::from(u32::MAX)) as u32
-                } else {
-                    count
-                };
-                let slot = entry.entry(canonical(&follower)).or_default();
-                *slot = slot.saturating_add(count);
+        let scale_count = |word: &str, count: u32| {
+            if spellings.contains_key(word) && needs_scaling(word) {
+                (f64::from(count) * scale).min(f64::from(u32::MAX)) as u32
+            } else {
+                count
             }
-        }
-        self.bigrams = merged
-            .into_iter()
-            .map(|(leader, followers)| {
-                let mut followers: Vec<(String, u32)> = followers.into_iter().collect();
-                followers.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-                (leader, followers)
-            })
+        };
+        let merge_followers = |followers: Vec<(String, u32)>| {
+            let mut merged: HashMap<String, u32> = HashMap::new();
+            for (follower, count) in followers {
+                let slot = merged.entry(canonical(&follower)).or_default();
+                *slot = slot.saturating_add(scale_count(&follower, count));
+            }
+            let mut merged: Vec<(String, u32)> = merged.into_iter().collect();
+            sort_followers(&mut merged);
+            merged
+        };
+
+        // Re-keying is only needed where a contraction is actually involved, which is a tiny
+        // minority of contexts. A context has to be rebuilt when a contraction appears anywhere
+        // in it, and also when it is keyed by one, because some other context's apostrophe-less
+        // spelling merges onto it. The scan above already saw every bigram follower, so the words
+        // that really occur as followers are known without re-testing the whole trigram table.
+        // One set for "is this word part of a contraction", so the scan below that walks every
+        // context in the table asks a single question of each word it passes
+        let contractions: HashSet<&str> = spellings.values().copied().collect();
+        let contract_words: HashSet<&str> = spellings
+            .keys()
+            .chain(contractions.iter())
+            .copied()
             .collect();
+        let mut follower_merges: HashSet<&str> = as_follower.keys().copied().collect();
+        follower_merges.extend(native.iter().map(String::as_str));
+        let touched = |key: &str, followers: &[(String, u32)]| {
+            contract_words.contains(key)
+                || followers
+                    .iter()
+                    .any(|(f, _)| follower_merges.contains(f.as_str()))
+        };
+
+        // Moving just the affected contexts leaves every other one in place, so startup
+        // doesn't rebuild the whole table
+        let mut merged: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+        let affected: Vec<String> = self
+            .bigrams
+            .iter()
+            .filter(|(leader, followers)| touched(leader, followers))
+            .map(|(leader, _)| leader.clone())
+            .collect();
+        for leader in affected {
+            let followers = self
+                .bigrams
+                .remove(&leader)
+                .expect("key was just collected from the map");
+            merged
+                .entry(canonical(&leader))
+                .or_default()
+                .extend(followers);
+            self.bigram_totals.remove(&leader);
+        }
+        for (leader, followers) in merged {
+            let followers = merge_followers(followers);
+            let total: u32 = followers.iter().map(|(_, count)| *count).sum();
+            self.bigrams.insert(leader.clone(), followers);
+            self.bigram_totals.insert(leader, total);
+        }
+
+        // The trigram model is re-keyed the same way, or "you don't know" would
+        // look for a triple the table files under "you dont know" and miss it
+        let mut merged_triples: HashMap<(String, String), Vec<(String, u32)>> = HashMap::new();
+        let affected: Vec<(String, String)> = self
+            .trigrams
+            .iter()
+            .filter(|((first, second), followers)| {
+                touched(first, followers) || touched(second, followers)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in affected {
+            let followers = self
+                .trigrams
+                .remove(&key)
+                .expect("key was just collected from the map");
+            merged_triples
+                .entry((canonical(&key.0), canonical(&key.1)))
+                .or_default()
+                .extend(followers);
+            self.trigram_totals.remove(&key);
+        }
+        for (key, followers) in merged_triples {
+            let followers = merge_followers(followers);
+            let total: u32 = followers.iter().map(|(_, count)| *count).sum();
+            self.trigrams.insert(key.clone(), followers);
+            self.trigram_totals.insert(key, total);
+        }
 
         self.rebuild_caches();
     }
@@ -269,14 +478,22 @@ impl Dictionary {
 
     /// Whether `word` (lowercase) is in the vocabulary, including the user's custom words
     pub fn is_known_word(&self, word: &str) -> bool {
+        self.node(word).is_some_and(|node| node.is_word)
+    }
+
+    /// Frequency of `word` (lowercase), or None when it is not in the vocabulary
+    pub fn frequency_of(&self, word: &str) -> Option<u64> {
+        self.node(word)
+            .filter(|node| node.is_word)
+            .map(|node| node.frequency)
+    }
+
+    fn node(&self, word: &str) -> Option<&TrieNode> {
         let mut node = &self.root;
         for ch in word.chars() {
-            match node.children.get(&ch) {
-                Some(next) => node = next,
-                None => return false,
-            }
+            node = node.children.get(&ch)?;
         }
-        node.is_word
+        Some(node)
     }
 
     pub fn insert(&mut self, word: &str, frequency: u64) {
@@ -292,6 +509,7 @@ impl Dictionary {
     pub fn rebuild_caches(&mut self) {
         self.words = Self::rebuild_node_cache(&mut self.root, "");
         self.word_letters = self.words.iter().map(|w| letter_bits(&w.word)).collect();
+        self.unigram_total = self.words.iter().map(|w| w.frequency).sum();
     }
 
     fn rebuild_node_cache(node: &mut TrieNode, current_prefix: &str) -> Vec<WordCandidate> {
@@ -338,8 +556,14 @@ impl Dictionary {
             .collect()
     }
 
-    /// Suggest top `limit` completions for `prefix` conditioned on `prev_word` (sentence context)
-    pub fn suggest(&self, prefix: &str, prev_word: Option<&str>, limit: usize) -> Vec<String> {
+    /// Suggest top `limit` completions for `prefix`, ranked by an interpolated
+    /// unigram / bigram / trigram estimate for the words in `ctx`.
+    ///
+    /// Candidates come from the three context tables and from the trie, then every
+    /// one of them is scored: raw counts from tables of very different sizes are
+    /// not comparable, so each order is turned into a probability over its own
+    /// context first and only then mixed together.
+    pub fn suggest(&self, prefix: &str, ctx: &Context, limit: usize) -> Vec<String> {
         if prefix.is_empty() {
             return Vec::new();
         }
@@ -353,71 +577,77 @@ impl Dictionary {
 
         // Apps that auto-insert typographic quotes type ’ for '
         let lower_prefix = prefix.to_lowercase().replace('\u{2019}', "'");
-        let mut results = Vec::new();
-        let mut seen = HashSet::new();
+        let mut evidence: HashMap<String, Evidence> = HashMap::new();
 
-        // 1. If we have a preceding word in the sentence context, check bigrams first!
-        if let Some(prev) = prev_word {
-            let clean_prev = prev.trim().to_lowercase();
-
-            // 1a. User learned personal bigrams first (highest priority, if learning enabled)
+        // 1. Every word the context tables expect here and that starts with the
+        //    prefix. These are the candidates unigram frequency alone would miss,
+        //    so they join the pool even when they are not among the most frequent
+        //    words for the prefix.
+        if let Some(prev) = &ctx.prev {
+            if let Some(prev_prev) = &ctx.prev_prev
+                && let Some(followers) = self.trigrams.get(&(prev_prev.clone(), prev.clone()))
+            {
+                for (follower, count) in followers {
+                    if follower.starts_with(&lower_prefix) {
+                        evidence.entry(follower.clone()).or_default().trigram = *count;
+                    }
+                }
+            }
             if self.learn_enabled
-                && let Some(user_followers) = self.user_bigrams.get(&clean_prev)
+                && let Some(user_followers) = self.user_bigrams.get(prev)
             {
-                for (follower, _) in user_followers {
-                    if follower.starts_with(&lower_prefix)
-                        && follower != &lower_prefix
-                        && seen.insert(follower.clone())
-                    {
-                        results.push(follower.clone());
-                        if results.len() >= limit {
-                            break;
-                        }
+                for (follower, count) in user_followers {
+                    if follower.starts_with(&lower_prefix) {
+                        let slot = evidence.entry(follower.clone()).or_default();
+                        slot.user = slot.user.max(*count);
                     }
                 }
             }
-
-            // 1b. Standard English bigrams (contextually aware)
-            if results.len() < limit
-                && let Some(followers) = self.bigrams.get(&clean_prev)
-            {
-                for (follower, _) in followers {
-                    if follower.starts_with(&lower_prefix)
-                        && follower != &lower_prefix
-                        && seen.insert(follower.clone())
-                    {
-                        results.push(follower.clone());
-                        if results.len() >= limit {
-                            break;
-                        }
+            if let Some(followers) = self.bigrams.get(prev) {
+                for (follower, count) in followers {
+                    if follower.starts_with(&lower_prefix) {
+                        evidence.entry(follower.clone()).or_default().bigram = *count;
                     }
                 }
             }
         }
 
-        // 2. Back off to unigram Trie for any remaining candidate slots
-        if results.len() < limit {
-            let unigram_cands = self.suggest_unigram(&lower_prefix, limit * 2);
-            for cand in unigram_cands {
-                if cand != lower_prefix && seen.insert(cand.clone()) {
-                    results.push(cand);
-                    if results.len() >= limit {
-                        break;
-                    }
-                }
-            }
+        // 2. The most frequent words for the prefix, which is the whole vocabulary
+        //    when there is no context to condition on
+        let unigram_pool = self.suggest_unigram(&lower_prefix, UNIGRAM_POOL);
+        for cand in &unigram_pool {
+            evidence.entry(cand.clone()).or_default();
         }
 
-        // 3. If exact prefix matching yielded NO candidates, fall back to similarity search!
-        // The vocabulary is English, so only queries containing Latin letters can be near a word
+        // 3. Score them all together and keep the best
+        let mut ranked: Vec<(f64, &String)> = evidence
+            .iter()
+            .filter(|(word, _)| *word != &lower_prefix)
+            .map(|(word, ev)| (self.score(word, &lower_prefix, ctx, *ev), word))
+            .collect();
+        // Ties fall back to the words themselves, so the bar never reorders itself
+        // between two identical requests
+        ranked.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(b.1))
+        });
+
+        let mut results: Vec<String> = ranked
+            .into_iter()
+            .take(limit)
+            .map(|(_, word)| word.clone())
+            .collect();
+
+        // 4. If exact prefix matching yielded NO candidates, fall back to similarity search!
+        //    The vocabulary is English, so only queries containing Latin letters can be near a word
         if self.typo_correction
             && results.is_empty()
             && lower_prefix.len() >= 2
             && lower_prefix.chars().any(|c| c.is_ascii_alphabetic())
         {
-            let similar_cands = self.suggest_similar(&lower_prefix, prev_word, limit);
-            for cand in similar_cands {
-                if cand != lower_prefix && seen.insert(cand.clone()) {
+            for cand in self.suggest_similar(&lower_prefix, ctx, limit) {
+                if cand != lower_prefix && !results.contains(&cand) {
                     results.push(cand);
                     if results.len() >= limit {
                         break;
@@ -426,7 +656,7 @@ impl Dictionary {
             }
         }
 
-        // 4. Format casing to match the user's typed prefix
+        // 5. Format casing to match the user's typed prefix
         results
             .into_iter()
             .take(limit)
@@ -446,13 +676,58 @@ impl Dictionary {
             .collect()
     }
 
+    /// Interpolated estimate that `word` is the completion, plus the lift for how
+    /// much of it the user has already typed.
+    ///
+    /// Each order contributes its share of the total and is renormalized over the
+    /// orders whose context actually exists, so a sentence the trigram table says
+    /// nothing about is scored by the bigram and unigram alone instead of being
+    /// held to a standard it cannot reach.
+    fn score(&self, word: &str, prefix: &str, ctx: &Context, ev: Evidence) -> f64 {
+        let mut weighted = 0.0;
+        let mut weight = 0.0;
+
+        if let Some(frequency) = self.frequency_of(word)
+            && self.unigram_total > 0
+        {
+            weighted += self.ranking.unigram * (frequency as f64 / self.unigram_total as f64);
+            weight += self.ranking.unigram;
+        }
+
+        if let Some(prev) = &ctx.prev {
+            if let Some(total) = self.bigram_totals.get(prev) {
+                weighted += self.ranking.bigram * (ev.bigram as f64 / *total as f64);
+                weight += self.ranking.bigram;
+            }
+            if let Some(prev_prev) = &ctx.prev_prev
+                && let Some(total) = self.trigram_totals.get(&(prev_prev.clone(), prev.clone()))
+            {
+                weighted += self.ranking.trigram * (ev.trigram as f64 / *total as f64);
+                weight += self.ranking.trigram;
+            }
+        }
+
+        if weight == 0.0 {
+            return 0.0;
+        }
+        let mut score = weighted / weight;
+
+        // A longer typed prefix means a more specific guess. Scaled by word length
+        // so this ranks words against each other, not long words against short ones.
+        let word_len = word.chars().count();
+        if word_len > 0 {
+            let typed = common_prefix_len(prefix, word) as f64;
+            score *= 1.0 + self.ranking.prefix_weight * (typed / word_len as f64);
+        }
+
+        if ev.user > 0 {
+            score += self.ranking.learned_bonus;
+        }
+        score
+    }
+
     /// Find the most similar words when exact prefix matching yields no results
-    pub fn suggest_similar(
-        &self,
-        query: &str,
-        prev_word: Option<&str>,
-        limit: usize,
-    ) -> Vec<String> {
+    pub fn suggest_similar(&self, query: &str, ctx: &Context, limit: usize) -> Vec<String> {
         let q_chars: Vec<char> = query.chars().collect();
         let q_len = q_chars.len();
         if q_len < 2 {
@@ -463,9 +738,8 @@ impl Dictionary {
         let mut candidates: Vec<(String, u64)> = Vec::new();
         let mut seen = HashSet::new();
 
-        // 1. Check bigram followers of prev_word first (contextual priority)
-        if let Some(pw) = prev_word {
-            let clean = pw.trim().to_lowercase();
+        // 1. Check the context tables of prev_word first (contextual priority)
+        if let Some(prev) = &ctx.prev {
             let mut f_chars: Vec<char> = Vec::with_capacity(32);
             let mut check_followers = |followers: &[(String, u32)]| {
                 for (follower, freq) in followers {
@@ -489,10 +763,15 @@ impl Dictionary {
                 }
             };
 
-            if let Some(user_f) = self.user_bigrams.get(&clean) {
+            if let Some(prev_prev) = &ctx.prev_prev
+                && let Some(trigram_f) = self.trigrams.get(&(prev_prev.clone(), prev.clone()))
+            {
+                check_followers(trigram_f);
+            }
+            if let Some(user_f) = self.user_bigrams.get(prev) {
                 check_followers(user_f);
             }
-            if let Some(bigram_f) = self.bigrams.get(&clean) {
+            if let Some(bigram_f) = self.bigrams.get(prev) {
                 check_followers(bigram_f);
             }
         }
@@ -828,7 +1107,7 @@ mod tests {
         let text = "program 1000\nprogress 800\nproject 900\nproblem 1500\ncompany 2000";
         let dict = Dictionary::from_frequency_text(text);
 
-        let res = dict.suggest("pro", None, 3);
+        let res = dict.suggest("pro", &Context::default(), 3);
         assert_eq!(res, vec!["problem", "program", "project"]);
     }
 
@@ -837,10 +1116,10 @@ mod tests {
         let text = "program 1000\nprogress 800\nproject 900";
         let dict = Dictionary::from_frequency_text(text);
 
-        let res_cap = dict.suggest("Pro", None, 2);
+        let res_cap = dict.suggest("Pro", &Context::default(), 2);
         assert_eq!(res_cap, vec!["Program", "Project"]);
 
-        let res_upper = dict.suggest("PRO", None, 2);
+        let res_upper = dict.suggest("PRO", &Context::default(), 2);
         assert_eq!(res_upper, vec!["PROGRAM", "PROJECT"]);
     }
 
@@ -854,24 +1133,131 @@ mod tests {
         dict.load_bigrams_tsv(bigram_text);
 
         // Without context: "much" is top unigram
-        let no_ctx = dict.suggest("m", None, 3);
+        let no_ctx = dict.suggest("m", &Context::default(), 3);
         assert_eq!(no_ctx[0], "much");
 
         // With "good" as context: "morning" is promoted to #1!
-        let with_ctx = dict.suggest("m", Some("good"), 3);
+        let with_ctx = dict.suggest("m", &Context::new(Some("good".to_string()), None), 3);
         assert_eq!(with_ctx[0], "morning");
         assert_eq!(with_ctx[1], "man");
+    }
+
+    /// "must" is what follows "in" according to the pairs, and overwhelmingly so.
+    /// "of in morning" is what the triples say, and it has to win anyway.
+    fn trigram_dict() -> Dictionary {
+        let unigrams = "morning 100\nmust 90\nmuch 400\nin 500";
+        let mut dict = Dictionary::from_frequency_text(unigrams);
+        dict.load_bigrams_tsv("in\tmust\t900000\nin\tmorning\t100");
+        dict.load_trigrams_tsv("of\tin\tmorning\t100");
+        dict.add_english_contractions();
+        dict
+    }
+
+    #[test]
+    fn test_trigram_overrides_a_stronger_bigram() {
+        let dict = trigram_dict();
+        let after_in = Context::new(Some("in".to_string()), None);
+        let after_of_in = Context::new(Some("in".to_string()), Some("of".to_string()));
+
+        // Without the word before "in", the pairs decide and "must" wins
+        assert_eq!(dict.suggest("m", &after_in, 3)[0], "must");
+        // With it, the triple decides
+        assert_eq!(dict.suggest("m", &after_of_in, 3)[0], "morning");
+    }
+
+    #[test]
+    fn test_trigram_survives_contraction_rekeying() {
+        // The triple is stored under the apostrophe-less spelling, like the pairs
+        let unigrams = "know 900\nnow 800\nnot 700";
+        let mut dict = Dictionary::from_frequency_text(unigrams);
+        dict.load_bigrams_tsv("you\tdont\t50");
+        dict.load_trigrams_tsv("you\tdont\tknow\t40");
+        dict.add_english_contractions();
+
+        // "you don't know" has to be found through "you don't"
+        let ctx = Context::new(Some("don't".to_string()), Some("you".to_string()));
+        assert_eq!(dict.suggest("k", &ctx, 1), vec!["know"]);
+    }
+
+    #[test]
+    fn test_rekey_keeps_both_spellings_of_a_context() {
+        // The table holds "dont" and "don't" side by side, which happens when the corpus
+        // kept some apostrophes. Merging one onto the other must not drop the followers the
+        // other one already had.
+        let unigrams = "know 900\nnow 800\nnot 700";
+        let mut dict = Dictionary::from_frequency_text(unigrams);
+        dict.load_bigrams_tsv("you\tdont\t50\nyou\tdon't\t30");
+        dict.load_trigrams_tsv("you\tdont\tknow\t40\nyou\tdon't\tknow\t10\nyou\tdon't\tnot\t20");
+        dict.add_english_contractions();
+
+        let ctx = Context::new(Some("don't".to_string()), Some("you".to_string()));
+        assert_eq!(dict.suggest("k", &ctx, 1), vec!["know"]);
+        // The follower that only existed under "don't" is still reachable
+        assert_eq!(dict.suggest("n", &ctx, 1), vec!["not"]);
+
+        assert_eq!(dict.bigrams["you"], vec![("don't".to_string(), 80)]);
+        let key = ("you".to_string(), "don't".to_string());
+        assert_eq!(
+            dict.trigrams[&key],
+            vec![("know".to_string(), 50), ("not".to_string(), 20)]
+        );
+        // "dont" is merged away, so no lookup can ask for a triple that no longer exists
+        assert!(!dict.bigrams.contains_key("dont"));
+        assert!(
+            !dict
+                .trigrams
+                .contains_key(&("you".to_string(), "dont".to_string()))
+        );
+        // Totals have to match what the merged lists actually hold
+        assert_eq!(dict.bigram_totals["you"], 80);
+        assert_eq!(dict.trigram_totals[&key], 70);
+    }
+
+    #[test]
+    fn test_trigram_weight_decides_between_the_orders() {
+        let mut dict = trigram_dict();
+        // Only meaningful with both words of context: the trigram order exists
+        // exactly when there is something before the previous word
+        let ctx = Context::new(Some("in".to_string()), Some("of".to_string()));
+
+        // Taking the trigram out of the estimate hands the decision back to the pairs
+        dict.set_ranking(Ranking {
+            trigram: 0.0,
+            ..Ranking::default()
+        });
+        assert_eq!(dict.suggest("m", &ctx, 1), vec!["must"]);
+
+        dict.set_ranking(Ranking::default());
+        assert_eq!(dict.suggest("m", &ctx, 1), vec!["morning"]);
+    }
+
+    #[test]
+    fn test_learned_phrase_outranks_a_stronger_pair() {
+        let dict = trigram_dict();
+        let ctx = Context::new(Some("in".to_string()), None);
+        assert_eq!(dict.suggest("m", &ctx, 1), vec!["must"]);
+
+        // One accepted suggestion outweighs the corpus
+        let mut dict = dict;
+        dict.record_user_bigram("in", "morning");
+        assert_eq!(dict.suggest("m", &ctx, 1), vec!["morning"]);
     }
 
     #[test]
     fn test_user_learned_bigrams() {
         let text = "server 500\nservice 200\nmy 1000";
         let mut dict = Dictionary::from_frequency_text(text);
-        assert_eq!(dict.suggest("s", Some("my"), 2)[0], "server");
+        assert_eq!(
+            dict.suggest("s", &Context::new(Some("my".to_string()), None), 2)[0],
+            "server"
+        );
 
         // User picks "service" after "my": it now comes first in that context
         dict.record_user_bigram("my", "service");
-        assert_eq!(dict.suggest("s", Some("my"), 2)[0], "service");
+        assert_eq!(
+            dict.suggest("s", &Context::new(Some("my".to_string()), None), 2)[0],
+            "service"
+        );
     }
 
     #[test]
@@ -928,21 +1314,24 @@ mod tests {
     #[test]
     fn test_contractions_replace_split_halves() {
         let dict = split_contraction_dict();
-        assert_eq!(dict.suggest("don", None, 3)[0], "don't");
-        assert_eq!(dict.suggest("don'", None, 1), vec!["don't"]);
-        assert_eq!(dict.suggest("didn", None, 1), vec!["didn't"]);
+        assert_eq!(dict.suggest("don", &Context::default(), 3)[0], "don't");
+        assert_eq!(dict.suggest("don'", &Context::default(), 1), vec!["don't"]);
+        assert_eq!(dict.suggest("didn", &Context::default(), 1), vec!["didn't"]);
         assert!(!dict.is_known_word("didn") && !dict.is_known_word("dont"));
         // "don" stays, but only as a rare word
         assert!(dict.is_known_word("don"));
-        assert_eq!(dict.suggest("Don", None, 1), vec!["Don't"]);
+        assert_eq!(dict.suggest("Don", &Context::default(), 1), vec!["Don't"]);
     }
 
     #[test]
     fn test_contraction_casing_and_curly_apostrophe() {
         let dict = split_contraction_dict();
-        assert_eq!(dict.suggest("i'", None, 1), vec!["I'm"]);
-        assert_eq!(dict.suggest("I'", None, 1), vec!["I'm"]);
-        assert_eq!(dict.suggest("don\u{2019}", None, 1), vec!["don't"]);
+        assert_eq!(dict.suggest("i'", &Context::default(), 1), vec!["I'm"]);
+        assert_eq!(dict.suggest("I'", &Context::default(), 1), vec!["I'm"]);
+        assert_eq!(
+            dict.suggest("don\u{2019}", &Context::default(), 1),
+            vec!["don't"]
+        );
     }
 
     #[test]
@@ -962,8 +1351,14 @@ mod tests {
     fn test_bigrams_follow_contractions() {
         let dict = split_contraction_dict();
         // "you dont" is rare in the bigram data, but scaled to the contraction's real frequency
-        assert_eq!(dict.suggest("d", Some("you"), 3)[0], "don't");
-        assert_eq!(dict.suggest("k", Some("don't"), 1), vec!["know"]);
+        assert_eq!(
+            dict.suggest("d", &Context::new(Some("you".to_string()), None), 3)[0],
+            "don't"
+        );
+        assert_eq!(
+            dict.suggest("k", &Context::new(Some("don't".to_string()), None), 1),
+            vec!["know"]
+        );
     }
 
     #[test]
@@ -973,7 +1368,7 @@ mod tests {
         dict.load_bigrams_tsv("you\tdo\t100\nyou\tdon't\t60\nyou\tdont\t1\nyou\tdecide\t20");
         dict.add_english_contractions();
         assert_eq!(
-            dict.suggest("d", Some("you"), 3),
+            dict.suggest("d", &Context::new(Some("you".to_string()), None), 3),
             vec!["do", "don't", "decide"]
         );
     }
@@ -991,13 +1386,13 @@ mod tests {
         dict.record_user_bigram("my", "service");
 
         // "server" has higher unigram frequency, so it stays #1
-        let res = dict.suggest("s", Some("my"), 2);
+        let res = dict.suggest("s", &Context::new(Some("my".to_string()), None), 2);
         assert_eq!(res[0], "server");
 
         // Re-enable learning
         dict.set_learning(true);
         dict.record_user_bigram("my", "service");
-        let res = dict.suggest("s", Some("my"), 2);
+        let res = dict.suggest("s", &Context::new(Some("my".to_string()), None), 2);
         assert_eq!(res[0], "service");
     }
 
@@ -1007,30 +1402,30 @@ mod tests {
         let dict = Dictionary::from_frequency_text(text);
 
         // 1. "exteon" (missing letters / typo) -> suggests "extension"
-        let res_exteon = dict.suggest("exteon", None, 1);
+        let res_exteon = dict.suggest("exteon", &Context::default(), 1);
         assert_eq!(res_exteon, vec!["extension"]);
 
         // 2. "definately" ('a' instead of 'i') -> suggests "definitely"
-        let res_def = dict.suggest("definately", None, 1);
+        let res_def = dict.suggest("definately", &Context::default(), 1);
         assert_eq!(res_def, vec!["definitely"]);
 
         // 3. "teh" (swapped adjacent letters) -> suggests "the"
-        let res_teh = dict.suggest("teh", None, 1);
+        let res_teh = dict.suggest("teh", &Context::default(), 1);
         assert_eq!(res_teh, vec!["the"]);
 
         // 4. "recieved" (swapped 'e' and 'i') -> suggests "received"
-        let res_rec = dict.suggest("recieved", None, 1);
+        let res_rec = dict.suggest("recieved", &Context::default(), 1);
         assert_eq!(res_rec, vec!["received"]);
 
         // 5. "comuter" (omitted 'p') -> suggests "computer"
-        let res_com = dict.suggest("comuter", None, 1);
+        let res_com = dict.suggest("comuter", &Context::default(), 1);
         assert_eq!(res_com, vec!["computer"]);
 
         // 6. Capitalization preservation on typo corrections:
-        let res_cap = dict.suggest("Exteon", None, 1);
+        let res_cap = dict.suggest("Exteon", &Context::default(), 1);
         assert_eq!(res_cap, vec!["Extension"]);
 
-        let res_all_caps = dict.suggest("TEH", None, 1);
+        let res_all_caps = dict.suggest("TEH", &Context::default(), 1);
         assert_eq!(res_all_caps, vec!["THE"]);
     }
 
@@ -1038,16 +1433,22 @@ mod tests {
     fn test_typo_correction_toggle() {
         let text = "extension 5000\nthe 10000\ntheme 900";
         let mut dict = Dictionary::from_frequency_text(text);
-        assert_eq!(dict.suggest("teh", None, 1), vec!["the"]);
+        assert_eq!(dict.suggest("teh", &Context::default(), 1), vec!["the"]);
 
         dict.set_typo_correction(false);
-        assert!(dict.suggest("teh", None, 3).is_empty());
-        assert!(dict.suggest("exteon", None, 3).is_empty());
+        assert!(dict.suggest("teh", &Context::default(), 3).is_empty());
+        assert!(dict.suggest("exteon", &Context::default(), 3).is_empty());
         // Prefix completion is unaffected
-        assert_eq!(dict.suggest("th", None, 2), vec!["the", "theme"]);
+        assert_eq!(
+            dict.suggest("th", &Context::default(), 2),
+            vec!["the", "theme"]
+        );
 
         dict.set_typo_correction(true);
-        assert_eq!(dict.suggest("exteon", None, 1), vec!["extension"]);
+        assert_eq!(
+            dict.suggest("exteon", &Context::default(), 1),
+            vec!["extension"]
+        );
     }
 
     #[test]

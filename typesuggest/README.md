@@ -15,8 +15,9 @@ A blazing fast, native **Windows-style hardware keyboard text suggestion tool** 
 - **Unrestricted Normal Typing & Caret Freedom:**
   - Words commit directly to the application; typing is never trapped in a locked pre-edit state.
   - Regular arrow keys and document navigation remain 100% free and unhindered.
-- **Contextual Bigram Language Model & Dynamic Phrase Learning:**
-  - Embedded 320,000 contextual word pairs (`bigrams.tsv`) to intelligently bias predictions based on sentence context (e.g. typing "m" after "good" suggests "morning" rather than "much").
+- **Contextual Trigram Language Model & Dynamic Phrase Learning:**
+  - Embedded 320,000 contextual word pairs (`bigrams.tsv`) and 319,000 word triples (`trigrams.tsv`) to intelligently bias predictions based on sentence context (e.g. typing "m" after "good" suggests "morning" rather than "much", and after "as soon" it gets closer still).
+  - Suggestions are scored by interpolating the three orders of word evidence — the word's own frequency, what follows the previous word, and what follows the previous two words — so a phrase can override a word that is simply more common elsewhere.
   - Learns which word you pick after which, saved to `~/.config/typesuggest/user_bigrams.tsv` (only pairs of dictionary words, so names, codes and passphrases are never stored).
   - Can be toggled on/off on the fly via `--learn`/`--no-learn` or in configuration.
 - **Microsecond Prefix Matching:**
