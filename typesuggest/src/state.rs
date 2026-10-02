@@ -16,6 +16,16 @@ const KEY_BACKSPACE: u32 = 0xff08;
 const KEY_DELETE: u32 = 0xffff;
 const KEY_SPACE: u32 = 0x0020;
 
+/// Abbreviations that are written with a full stop but do not end a sentence, so a space
+/// must not follow them. Left out are names and months, which modern style writes without
+/// a full stop, and which read fine either way expanded.
+const ABBREVIATIONS: &[&str] = &[
+    "al", "approx", "assn", "ave", "blvd", "bros", "ca", "cf", "ch", "cit", "co", "corp", "dept",
+    "dr", "ed", "eds", "eg", "eq", "est", "etc", "fig", "ft", "govt", "hr", "hrs", "ibid", "ie",
+    "inc", "ltd", "max", "mgmt", "min", "mr", "mrs", "ms", "mt", "no", "op", "pp", "prof", "rd",
+    "ref", "rep", "sec", "seq", "sr", "st", "univ", "viz", "vol", "vs",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputMode {
     Idle,
@@ -137,6 +147,26 @@ fn clean_context_word(word: &str) -> Option<String> {
     let clean = word.trim().to_lowercase().replace('\u{2019}', "'");
     (clean.chars().count() >= 2 && clean.chars().all(|c| c.is_alphabetic() || c == '\''))
         .then_some(clean)
+}
+
+/// Whether `mark` after `prefix` ends a sentence, so that a space belongs after it.
+///
+/// A number is left alone, because "3." is the decimal point in "3.14" and the version
+/// mark in "2.0". An initial or an abbreviation is left alone, because the full stop in
+/// "J. R. R. Tolkien" or "etc." only separates, and expanding the word there would change
+/// what was written.
+fn ends_sentence(prefix: &str, mark: char) -> bool {
+    if prefix.is_empty() || prefix.chars().any(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    // Exclamations and questions are never abbreviations or initials
+    if mark != '.' {
+        return true;
+    }
+    if prefix.chars().count() == 1 {
+        return false;
+    }
+    !ABBREVIATIONS.contains(&prefix.to_lowercase().as_str())
 }
 
 /// Where the identifier segment ending at `end` begins, for a word that starts at
@@ -453,7 +483,14 @@ impl StateMachine {
     /// Whether `handle_key_press` might swallow this key instead of letting it reach the app.
     /// Only keys pressed while navigating, and Up while suggestions are shown (it starts
     /// navigating), can be swallowed; every other key is forwarded whatever it does here.
-    pub fn may_swallow(&self, keysym: u32, ctrl_active: bool) -> bool {
+    pub fn may_swallow(&self, keysym: u32, ch: Option<char>, ctrl_active: bool) -> bool {
+        // A sentence-ending mark is swallowed to leave a space after the word, which depends
+        // on the word before the caret. Saying so for every mark costs a moment of latency on
+        // a key that does end a sentence anyway, and cannot cost correctness: the key is
+        // forwarded either way, only later.
+        if !ctrl_active && ch.is_some_and(|c| matches!(c, '.' | '!' | '?')) {
+            return true;
+        }
         match self.mode {
             InputMode::Navigating { .. } => true,
             // The bar preselects its best candidate, so Tab takes it without an Up press
@@ -610,7 +647,15 @@ impl StateMachine {
             }
         }
 
-        // 2. If currently in Navigating mode, handle candidate selection keys
+        // 2. A sentence-ending mark closes the word and leaves a space for the next one.
+        // This is asked before candidate navigation is resolved, because navigating is
+        // about to give up the highlight on any ordinary key, and which candidate the user
+        // meant has to be read while it is still known.
+        if let Some(action) = self.close_sentence(ch) {
+            return action;
+        }
+
+        // 3. If currently in Navigating mode, handle candidate selection keys
         if let InputMode::Navigating {
             candidates,
             selected_index,
@@ -694,20 +739,31 @@ impl StateMachine {
         self.handle_typing_key(keysym, ch, dict)
     }
 
-    /// 3. Normal typing & navigation keys (anything not handled as a shortcut or navigation key)
+    /// 4. Normal typing & navigation keys (anything not handled as a shortcut or navigation key)
     ///
     /// Replace the word around the caret with `candidates[index]` and hand the app the
     /// edit. Shared by both modes, so accepting the preselected candidate and accepting
     /// one picked while navigating produce the same commit.
     fn commit_candidate(&mut self, index: usize, candidates: Vec<String>) -> KeyAction {
+        self.commit_candidate_ending(index, candidates, "")
+    }
+
+    /// Commit `candidates[index]`, followed by `ending` such as the full stop and space
+    /// that close off a sentence.
+    fn commit_candidate_ending(
+        &mut self,
+        index: usize,
+        candidates: Vec<String>,
+        ending: &str,
+    ) -> KeyAction {
         let chosen = candidates[index].clone();
         let (prefix, context) = self.buffer.current_word_context();
         let prev_word = context.prev.clone();
         let suffix = self.buffer.current_word_suffix();
-        let replacement = if self.trailing_space {
-            format!("{} ", chosen)
+        let replacement = if ending.is_empty() && self.trailing_space {
+            format!("{chosen} ")
         } else {
-            chosen.clone()
+            format!("{chosen}{ending}")
         };
         self.buffer
             .apply_replacement(prefix.chars().count(), suffix.chars().count(), &replacement);
@@ -733,6 +789,72 @@ impl StateMachine {
         KeyAction::UpdateSelection { index }
     }
 
+    /// Act on a sentence-ending mark at the end of a word: take the suggestion the user
+    /// pointed at, if any, and leave a space ready for the next sentence. Returns `None`
+    /// for every other key, and for a mark that does not end a sentence.
+    fn close_sentence(&mut self, ch: Option<char>) -> Option<KeyAction> {
+        let mark = match ch {
+            Some(mark @ ('.' | '!' | '?')) => mark,
+            _ => return None,
+        };
+        // Mid-word the mark belongs inside the word being edited, not after it
+        if !self.buffer.current_word_suffix().is_empty() {
+            return None;
+        }
+        // "Wait..." must not come out as "Wait. . .": a mark typed straight after one
+        // already followed by a space takes that space back and joins the run.
+        let cur = self.buffer.cursor;
+        if cur >= 2 && self.buffer.chars[cur - 1] == ' ' && self.buffer.chars[cur - 2] == mark {
+            return Some(self.add_sentence_ending(1, &mark.to_string()));
+        }
+        let (prefix, _) = self.buffer.current_word_context();
+        if !ends_sentence(&prefix, mark) {
+            return None;
+        }
+        let ending = if self.trailing_space {
+            format!("{mark} ")
+        } else {
+            mark.to_string()
+        };
+        Some(match &self.mode {
+            // Only a bar the user has engaged says which candidate they meant. Merely being
+            // offered one does not, and completing it here would rewrite a word the user
+            // had already finished typing ("begin." is not "beginning."), so a word left
+            // alone keeps its own spelling and only gains the space.
+            InputMode::Navigating {
+                candidates,
+                selected_index,
+                ..
+            } if !candidates.is_empty() => {
+                let (index, candidates) = (*selected_index, candidates.clone());
+                self.commit_candidate_ending(index, candidates, &ending)
+            }
+            _ => self.add_sentence_ending(0, &ending),
+        })
+    }
+
+    /// Close off the sentence the caret sits in, inserting `ending` after the word already
+    /// typed and dropping `delete` characters before it. The word itself is left exactly as
+    /// the user wrote it, since no candidate was chosen, and only the text that ends the
+    /// sentence is added.
+    fn add_sentence_ending(&mut self, delete: usize, ending: &str) -> KeyAction {
+        let (prefix, context) = self.buffer.current_word_context();
+        let prev_word = context.prev.clone();
+        let deleted_before: String = self.buffer.chars[self.buffer.cursor - delete..]
+            .iter()
+            .take(delete)
+            .collect();
+        self.buffer.apply_replacement(delete, 0, ending);
+        self.mode = InputMode::Idle;
+        KeyAction::CommitCandidate {
+            deleted_before,
+            deleted_after: String::new(),
+            replacement: ending.to_string(),
+            prev_word,
+            chosen_word: prefix,
+        }
+    }
+
     fn handle_typing_key(&mut self, keysym: u32, ch: Option<char>, dict: &Dictionary) -> KeyAction {
         // The top candidate is highlighted as soon as the bar appears, so Tab can take it right
         // away. Without this the key would reach the app, and taking the suggestion would
@@ -751,6 +873,7 @@ impl StateMachine {
             let candidates = candidates.clone();
             return self.commit_candidate(0, candidates);
         }
+
         match keysym {
             KEY_UP => {
                 // If in Suggesting mode with candidates, Up enters navigation!
@@ -1118,6 +1241,138 @@ mod tests {
     }
 
     #[test]
+    fn test_sentence_mark_closes_the_word_and_leaves_a_space() {
+        let dict = setup_dict();
+        for (typed, mark, result) in [
+            ("begin", '.', "begin. "),
+            ("begin", '!', "begin! "),
+            ("begin", '?', "begin? "),
+            // A word the user had already finished keeps its own spelling: being offered a
+            // longer word is not a request to change what was written
+            ("morning", '.', "morning. "),
+            // The next sentence can be typed straight away
+            ("good mor", '.', "good mor. "),
+        ] {
+            let mut sm = StateMachine::new(2);
+            for c in typed.chars() {
+                sm.handle_key_press(c as u32, Some(c), false, &dict);
+            }
+            let act = sm.handle_key_press(mark as u32, Some(mark), false, &dict);
+            assert!(
+                matches!(act, KeyAction::CommitCandidate { .. }),
+                "{typed:?} then {mark:?} gave {act:?}"
+            );
+            assert_eq!(sm.buffer.chars.iter().collect::<String>(), result);
+            assert_eq!(sm.mode, InputMode::Idle);
+        }
+    }
+
+    #[test]
+    fn test_sentence_mark_takes_the_suggestion_the_user_picked() {
+        let dict = setup_dict();
+        // Only an engaged bar says which candidate was meant
+        for (keys, result) in [(0, "program. "), (1, "progress. ")] {
+            let mut sm = StateMachine::new(3);
+            for c in "prog".chars() {
+                sm.handle_key_press(c as u32, Some(c), false, &dict);
+            }
+            sm.handle_key_press(KEY_UP, None, false, &dict);
+            for _ in 0..keys {
+                sm.handle_key_press(KEY_RIGHT, None, false, &dict);
+            }
+            sm.handle_key_press('.' as u32, Some('.'), false, &dict);
+            assert_eq!(sm.buffer.chars.iter().collect::<String>(), result);
+        }
+    }
+
+    #[test]
+    fn test_marks_that_do_not_end_a_sentence_are_left_alone() {
+        let dict = setup_dict();
+        for typed in [
+            // Abbreviations, whose full stop only separates
+            "etc", "no", "min", "dr", "prof", "est", "vol", "cf", "univ",
+            // Initials, as in "J. R. R. Tolkien"
+            "i", "j", "x",
+            // Numbers, as in the decimal point of "3.14" or the version mark of "2.0"
+            "3", "12",
+        ] {
+            let mut sm = StateMachine::new(2);
+            for c in typed.chars() {
+                sm.handle_key_press(c as u32, Some(c), false, &dict);
+            }
+            let before = sm.buffer.chars.iter().collect::<String>();
+            sm.handle_key_press('.' as u32, Some('.'), false, &dict);
+            assert_eq!(
+                sm.buffer.chars.iter().collect::<String>(),
+                format!("{before}."),
+                "{typed:?} was treated as a sentence end"
+            );
+        }
+    }
+
+    #[test]
+    fn test_exclamation_and_question_ignore_the_abbreviation_list() {
+        let dict = setup_dict();
+        // Only a full stop separates an abbreviation or an initial
+        for (typed, mark) in [("etc", '!'), ("etc", '?'), ("i", '!'), ("i", '?')] {
+            let mut sm = StateMachine::new(2);
+            for c in typed.chars() {
+                sm.handle_key_press(c as u32, Some(c), false, &dict);
+            }
+            sm.handle_key_press(mark as u32, Some(mark), false, &dict);
+            assert_eq!(
+                sm.buffer.chars.iter().collect::<String>(),
+                format!("{typed}{mark} "),
+                "{typed:?} then {mark:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_repeated_marks_do_not_pile_up_spaces() {
+        let dict = setup_dict();
+        let mut sm = StateMachine::new(2);
+        for c in "begin".chars() {
+            sm.handle_key_press(c as u32, Some(c), false, &dict);
+        }
+        // "begin..." rather than "begin. . ."
+        for _ in 0..3 {
+            sm.handle_key_press('.' as u32, Some('.'), false, &dict);
+        }
+        assert_eq!(sm.buffer.chars.iter().collect::<String>(), "begin...");
+    }
+
+    #[test]
+    fn test_sentence_mark_respects_the_trailing_space_setting() {
+        let dict = setup_dict();
+        let mut sm = StateMachine::new(2);
+        sm.trailing_space = false;
+        for c in "begin".chars() {
+            sm.handle_key_press(c as u32, Some(c), false, &dict);
+        }
+        sm.handle_key_press('.' as u32, Some('.'), false, &dict);
+        assert_eq!(sm.buffer.chars.iter().collect::<String>(), "begin.");
+    }
+
+    #[test]
+    fn test_mid_word_mark_is_part_of_the_word() {
+        let dict = setup_dict();
+        let mut sm = StateMachine::new(2);
+        for c in "begin".chars() {
+            sm.handle_key_press(c as u32, Some(c), false, &dict);
+        }
+        // The caret sits inside the word, so the mark belongs inside it
+        for _ in 0..4 {
+            sm.buffer.move_left();
+        }
+        let act = sm.handle_key_press('.' as u32, Some('.'), false, &dict);
+        assert!(
+            !matches!(act, KeyAction::CommitCandidate { .. }),
+            "{act:?} should not have ended the sentence"
+        );
+    }
+
+    #[test]
     fn test_identifier_segments_are_completed_on_their_own() {
         let dict = setup_dict();
         // Only the segment being typed is completed; the rest of the identifier stands
@@ -1264,12 +1519,12 @@ mod tests {
         let dict = setup_dict();
         let mut sm = StateMachine::new(3);
 
-        // Punctuation is typed and hides the bar
+        // Punctuation that does not end a sentence is typed and hides the bar
         type_and_navigate(&mut sm, &dict, "pro");
-        let act = sm.handle_key_press('.' as u32, Some('.'), false, &dict);
+        let act = sm.handle_key_press(',' as u32, Some(','), false, &dict);
         assert_eq!(act, KeyAction::HideSuggestions);
         assert_eq!(sm.mode, InputMode::Idle);
-        assert_eq!(sm.buffer.chars.iter().collect::<String>(), "pro.");
+        assert_eq!(sm.buffer.chars.iter().collect::<String>(), "pro,");
 
         // A key without text (Shift) is forwarded; the bar stays up without the highlight
         sm.reset();
@@ -1774,7 +2029,7 @@ mod tests {
                     if setup == 2 {
                         sm.handle_key_press(KEY_UP, None, false, &dict);
                     }
-                    let may = sm.may_swallow(key, ctrl);
+                    let may = sm.may_swallow(key, ch, ctrl);
                     let act = sm.handle_key_press(key, ch, ctrl, &dict);
                     assert!(
                         may || !is_swallowed(&act),

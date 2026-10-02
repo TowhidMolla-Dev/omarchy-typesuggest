@@ -165,6 +165,7 @@ systemctl --user restart typesuggest.service
 | **`Enter` / `Return`** | Inserts newline / submits in app | **Commits candidate + space** (swallowed, zero accidental chat sends) |
 | **`Space`** | Inserts space in document | **Commits candidate + space** (swallowed) |
 | **`Tab`** | **Commits the highlighted candidate + space** (swallowed) | **Cycles to the next pill**; on the last pill it commits it |
+| **`.` `!` `?`** | **Closes the word and adds a space** (swallowed) | **Commits the highlighted candidate, then closes the word and adds a space** (swallowed) |
 
 The bar highlights its best suggestion as soon as it appears, so `Tab` takes it without any
 navigation first. Once you have entered navigation with `Up` or an arrow key, `Tab` walks the
@@ -173,6 +174,13 @@ alternatives instead, and `Enter` or `Space` commits whichever pill is highlight
 `Space` and `Enter` deliberately keep their normal meaning while the bar is merely up. Every word
 in the dictionary is the prefix of some longer entry (`work` of `work-` and `set-up`, `set` of
 `setback`), so committing on `Space` would rewrite the word you had just finished typing.
+
+Typing a full stop, exclamation mark or question mark closes the word and puts a space after
+it, so the next sentence can be started straight away. While you have entered navigation with
+`Up` or an arrow key, the candidate the bar points at is committed first; otherwise the word is
+left exactly as you typed it and only gains the space. Marks that do not end a sentence are left
+alone: the decimal point in `3.14`, the full stop in `2.0`, an initial as in `J. R. R. Tolkien`,
+and an abbreviation such as `etc.` or `Dr.` Typing `...` gives an ellipsis rather than `. . .`
 
 The keys that commit (`accept_keys`) and the space after the word (`trailing_space`) can be changed in the configuration. A key left out of `accept_keys` ends navigation and reaches the app as usual, so with `accept_keys = space, tab` Enter always sends your message.
 

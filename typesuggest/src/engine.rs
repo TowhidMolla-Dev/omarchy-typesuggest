@@ -976,7 +976,10 @@ impl Dispatch<zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2, (
 
                     // Keys that cannot be swallowed go to the app before any slower work (window
                     // and process checks, dictionary lookups, drawing), so typing never waits on it
-                    if !state.state_machine.may_swallow(keysym_raw, ctrl_active) {
+                    if !state
+                        .state_machine
+                        .may_swallow(keysym_raw, char_opt, ctrl_active)
+                    {
                         forward!();
                         let _ = conn.flush();
                     }
